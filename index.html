@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Mouse Cam</title>
+<style>
+/* VOICE: quiet, practical night tool
+   IDEA: a trail camera's control panel
+   PICTURE: the live camera view itself, large, with a motion meter
+   COLOUR and TYPE: deep night green-black, pale ink, one amber accent for "recording"; system sans
+   LAYOUT: view on top, controls below, clip list last */
+:root{--bg:#0e1311;--panel:#18201c;--line:#2a3530;--ink:#e8eee9;--dim:#9aa8a0;--acc:#ffb020;--rec:#ff4d3d}
+*{box-sizing:border-box;min-width:0}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,system-ui,sans-serif;padding:16px max(4vw,14px) 60px}
+h1{font-size:32px;line-height:1.05;margin:4px 0 4px}
+p.sub{color:var(--dim);margin:0 0 16px}
+.view{position:relative;background:#000;border-radius:14px;overflow:hidden;aspect-ratio:4/3;max-height:62vh;width:100%}
+video#live{width:100%;height:100%;object-fit:contain;display:block}
+.badge{position:absolute;top:12px;left:12px;background:#000a;padding:6px 12px;border-radius:99px;font-size:14px;font-weight:600}
+.badge.rec{background:var(--rec);color:#fff}
+.meter{position:absolute;left:12px;right:12px;bottom:12px;height:10px;background:#0008;border-radius:99px;overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:var(--acc);transition:width .1s}
+.meter b{position:absolute;top:-3px;bottom:-3px;width:2px;background:#fff}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;margin-top:14px;display:grid;gap:14px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+button,select{font:inherit;font-size:16px;min-height:44px;padding:0 18px;border-radius:10px;border:1px solid var(--line);background:#222c27;color:var(--ink)}
+button.go{background:var(--acc);color:#1b1200;border:0;font-weight:700}
+button.stop{background:var(--rec);color:#fff;border:0;font-weight:700}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+label{display:grid;gap:4px;flex:1 1 220px;color:var(--dim);font-size:14px}
+input[type=range]{width:100%;height:44px;accent-color:var(--acc)}
+.stat{color:var(--dim);font-size:14px}
+h2{font-size:22px;margin:28px 0 10px}
+.clips{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr))}
+.clip{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.clip video{width:100%;display:block;background:#000;aspect-ratio:4/3}
+.clip .row{padding:10px}
+.clip .t{flex:1;font-weight:600;white-space:nowrap}
+.clip button{padding:0 12px}
+.empty{color:var(--dim)}
+#dim{position:fixed;inset:0;background:#000;display:none;z-index:9;color:#444;font-size:14px;align-items:flex-end;justify-content:center;padding:30px}
+#dim.on{display:flex}
+#dim span.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#333;margin-right:8px}
+#dim.rec span.dot{background:#a22}
+.err{color:#ff8a7a}
+</style>
+</head>
+<body>
+<h1>Mouse Cam</h1>
+<p class="sub">Records a clip whenever something moves. Everything stays on this device.</p>
+
+<div class="view">
+  <video id="live" playsinline muted autoplay></video>
+  <div class="badge" id="badge">Camera off</div>
+  <div class="meter"><i id="lvl"></i><b id="mark"></b></div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <button class="go" id="startBtn">Start watching</button>
+    <button id="dimBtn" disabled>Darken screen</button>
+    <select id="cam" aria-label="Camera"><option value="environment">Back camera</option><option value="user">Front camera</option></select>
+  </div>
+  <div class="row">
+    <label>Sensitivity <span id="sensV"></span><input type="range" id="sens" min="1" max="100" value="80"></label>
+    <label>Keep recording after motion stops: <span id="tailV"></span><input type="range" id="tail" min="2" max="30" value="6"></label>
+  </div>
+  <div class="stat" id="stat">Tip: plug the iPad in and set Settings › Display › Auto-Lock to Never as a backup.</div>
+</div>
+
+<h2>Clips <span class="stat" id="count"></span></h2>
+<div class="row" style="margin-bottom:12px"><button id="clearBtn">Delete all clips</button></div>
+<div class="clips" id="clips"></div>
+
+<div id="dim"><span><span class="dot"></span><span id="dimTxt">Watching. Tap to wake.</span></span></div>
+
+<script>
+{
+const $ = id => document.getElementById(id);
+const live = $('live'), badge = $('badge'), lvl = $('lvl'), mark = $('mark');
+const W = 96, H = 72, PIX = 28;          // analysis size and per-pixel change threshold
+const ARM_DELAY = 5000, MAX_CLIP = 120000;
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d', { willReadFrequently: true });
+let stream = null, prev = null, timer = null, armedAt = 0;
+let rec = null, chunks = [], recStart = 0, lastMotion = 0, wakeLock = null;
+let memClips = [], db = null;
+
+// ---------- settings ----------
+const load = k => { try { return localStorage.getItem('mc_' + k); } catch (e) { return null; } };
+const save = (k, v) => { try { localStorage.setItem('mc_' + k, v); } catch (e) {} };
+for (const k of ['sens', 'tail', 'cam']) { const v = load(k); if (v) $(k).value = v; $(k).onchange = () => save(k, $(k).value); }
+const minPixels = () => Math.round(1 + (100 - $('sens').value) * 0.6);  // high sensitivity => few pixels needed
+const showSettings = () => {
+  $('sensV').textContent = $('sens').value + '%';
+  $('tailV').textContent = $('tail').value + ' s';
+  mark.style.left = 'calc(' + Math.min(100, minPixels() / 60 * 100) + '% )';
+};
+$('sens').oninput = $('tail').oninput = showSettings; showSettings();
+
+// ---------- storage (IndexedDB, falls back to memory) ----------
+function openDB() {
+  return new Promise(res => {
+    try {
+      const r = indexedDB.open('mousecam', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('clips', { keyPath: 'id', autoIncrement: true });
+      r.onsuccess = () => res(r.result); r.onerror = () => res(null);
+    } catch (e) { res(null); }
+  });
+}
+function tx(mode, fn) {
+  return new Promise(res => {
+    try { const t = db.transaction('clips', mode); const r = fn(t.objectStore('clips')); t.oncomplete = () => res(r && r.result); t.onerror = () => res(null); }
+    catch (e) { res(null); }
+  });
+}
+async function addClip(c) {
+  if (db) { const ok = await tx('readwrite', s => s.add(c)); if (ok !== null) return; }
+  c.id = Date.now(); memClips.push(c);
+}
+async function allClips() { const a = db ? (await tx('readonly', s => s.getAll())) || [] : []; return a.concat(memClips); }
+async function delClip(id) { memClips = memClips.filter(c => c.id !== id); if (db) await tx('readwrite', s => s.delete(id)); }
+async function clearClips() { memClips = []; if (db) await tx('readwrite', s => s.clear()); }
+
+// ---------- clip list ----------
+let urls = [];
+const fmt = t => new Date(t).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const ext = type => type.includes('mp4') ? 'mp4' : 'webm';
+async function render() {
+  urls.forEach(u => URL.revokeObjectURL(u)); urls = [];
+  const list = (await allClips()).sort((a, b) => b.t - a.t);
+  $('count').textContent = list.length ? '(' + list.length + ')' : '';
+  const box = $('clips'); box.textContent = '';
+  if (!list.length) { box.innerHTML = '<p class="empty">No clips yet. Start watching and leave the iPad pointed at the spot.</p>'; return; }
+  for (const c of list) {
+    const u = URL.createObjectURL(c.blob); urls.push(u);
+    const el = document.createElement('div'); el.className = 'clip';
+    el.innerHTML = '<video controls playsinline preload="metadata"></video><div class="row"><span class="t"></span><button data-a="save">Save</button><button data-a="del">Delete</button></div>';
+    el.querySelector('video').src = u;
+    el.querySelector('.t').textContent = fmt(c.t) + ' · ' + Math.round(c.dur / 1000) + ' s';
+    el.querySelector('[data-a=save]').onclick = () => saveClip(c, u);
+    el.querySelector('[data-a=del]').onclick = async () => { await delClip(c.id); render(); };
+    box.appendChild(el);
+  }
+}
+async function saveClip(c, u) {
+  const name = 'mousecam-' + new Date(c.t).toISOString().replace(/[:.]/g, '-') + '.' + ext(c.type);
+  const file = new File([c.blob], name, { type: c.type });
+  try { if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file] }); return; } }
+  catch (e) { if (e.name === 'AbortError') return; }
+  const a = document.createElement('a'); a.href = u; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+}
+$('clearBtn').onclick = async () => {
+  const b = $('clearBtn');
+  if (b.dataset.sure) { await clearClips(); delete b.dataset.sure; b.textContent = 'Delete all clips'; render(); }
+  else { b.dataset.sure = 1; b.textContent = 'Tap again to delete all'; setTimeout(() => { delete b.dataset.sure; b.textContent = 'Delete all clips'; }, 4000); }
+};
+
+// ---------- recording ----------
+function pickType() {
+  for (const t of ['video/mp4', 'video/webm;codecs=vp9', 'video/webm'])
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+  return '';
+}
+function startRec() {
+  const type = pickType();
+  try { rec = type ? new MediaRecorder(stream, { mimeType: type }) : new MediaRecorder(stream); }
+  catch (e) { $('stat').innerHTML = '<span class="err">This browser cannot record video.</span>'; return; }
+  chunks = []; recStart = Date.now();
+  rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  rec.onstop = async () => {
+    const t = rec.mimeType || type || 'video/mp4';
+    const blob = new Blob(chunks, { type: t }); chunks = [];
+    const c = { t: recStart, dur: Date.now() - recStart, type: t, blob };
+    rec = null; setBadge();
+    if (blob.size) { await addClip(c); render(); }
+  };
+  rec.start(1000); setBadge();
+}
+function stopRec() { if (rec && rec.state !== 'inactive') rec.stop(); }
+
+// ---------- motion detection ----------
+function tick() {
+  if (!stream || live.readyState < 2) return;
+  ctx.drawImage(live, 0, 0, W, H);
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const cur = new Uint8Array(W * H);
+  let changed = 0;
+  for (let i = 0, p = 0; p < cur.length; i += 4, p++) {
+    cur[p] = (d[i] * 3 + d[i + 1] * 6 + d[i + 2]) / 10;
+    if (prev && Math.abs(cur[p] - prev[p]) > PIX) changed++;
+  }
+  prev = cur;
+  lvl.style.width = Math.min(100, changed / 60 * 100) + '%';
+  const now = Date.now();
+  if (now < armedAt) { badge.textContent = 'Starting in ' + Math.ceil((armedAt - now) / 1000) + ' s'; return; }
+  if (changed >= minPixels()) {
+    lastMotion = now;
+    if (!rec) startRec();
+  }
+  if (rec && (now - lastMotion > $('tail').value * 1000 || now - recStart > MAX_CLIP)) stopRec();
+  setBadge();
+}
+function setBadge() {
+  const r = !!rec;
+  badge.className = 'badge' + (r ? ' rec' : '');
+  if (stream && Date.now() >= armedAt) badge.textContent = r ? '● Recording' : 'Watching';
+  $('dim').classList.toggle('rec', r);
+  $('dimTxt').textContent = (r ? 'Recording.' : 'Watching.') + ' Tap to wake.';
+}
+
+// ---------- start / stop ----------
+async function lock() {
+  try { if ('wakeLock' in navigator && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: $('cam').value, width: { ideal: 1280 }, height: { ideal: 960 } }, audio: false });
+  } catch (e) {
+    $('stat').innerHTML = '<span class="err">Camera not available: ' + String(e.name || e).replace(/[<>&]/g, '') + '. Allow camera access for this site in Safari.</span>';
+    return;
+  }
+  live.srcObject = stream; await live.play().catch(() => {});
+  prev = null; armedAt = Date.now() + ARM_DELAY;
+  timer = setInterval(tick, 150);
+  await lock();
+  $('startBtn').textContent = 'Stop'; $('startBtn').className = 'stop';
+  $('dimBtn').disabled = false; $('cam').disabled = true;
+  $('stat').textContent = 'Walk away now. Wave a hand in view to test: the bar should jump past the white line.';
+}
+function stop() {
+  stopRec(); clearInterval(timer); timer = null;
+  if (stream) stream.getTracks().forEach(t => t.stop()); stream = null; live.srcObject = null;
+  try { wakeLock && wakeLock.release(); } catch (e) {} wakeLock = null;
+  badge.className = 'badge'; badge.textContent = 'Camera off'; lvl.style.width = '0';
+  $('startBtn').textContent = 'Start watching'; $('startBtn').className = 'go';
+  $('dimBtn').disabled = true; $('cam').disabled = false;
+}
+$('startBtn').onclick = () => stream ? stop() : start();
+$('dimBtn').onclick = () => $('dim').classList.add('on');
+$('dim').onclick = () => $('dim').classList.remove('on');
+document.addEventListener('visibilitychange', () => { if (stream && document.visibilityState === 'visible') lock(); });
+window.addEventListener('beforeunload', e => { if (rec) { e.preventDefault(); e.returnValue = ''; } });
+
+if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+  $('stat').innerHTML = '<span class="err">Camera access needs this page to be opened over https in Safari.</span>';
+
+openDB().then(d => { db = d; render(); });
+}
+</script>
+</body>
+</html>
